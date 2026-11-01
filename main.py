@@ -58,6 +58,7 @@ class PermissionObfuscator:
         used = set()
         for role in self.permissions.keys():
             new_role_name = f"{prefix}-{secrets.token_hex(4)}"
+            # Eight hex characters is a small space when a file holds many roles, so the retry loop is not decoration. Without it a collision would silently merge two roles into one key and drop a whole permission list.
             while new_role_name in used:
                 new_role_name = f"{prefix}-{secrets.token_hex(4)}"
             used.add(new_role_name)
@@ -86,6 +87,7 @@ class PermissionObfuscator:
         """
         renamed = self.rename_roles(prefix)
         entries = list(renamed.items())
+        # I use the system random source here, not the plain random module that reorder_permissions below uses. The role shuffle in the main transform should not be reproducible from a seed, while the standalone reorder helper predates that choice and still shuffles with random.
         rng = secrets.SystemRandom()
         rng.shuffle(entries)
 
@@ -96,6 +98,7 @@ class PermissionObfuscator:
             for path in paths:
                 if path not in token_by_path:
                     token = f"path-{secrets.token_hex(8)}"
+                    # Scanning the values on every new path makes this slower as the file grows, squarely so. I keep the simple form because the input is a policy file a person wrote, not a data set, and distinct tokens matter more here than speed.
                     while token in token_by_path.values():
                         token = f"path-{secrets.token_hex(8)}"
                     token_by_path[path] = token
@@ -118,6 +121,7 @@ class PermissionObfuscator:
         new_permissions = {}
         for role, paths in self.permissions.items():
             new_paths = paths[:]  # Create a copy to avoid modifying the original
+            # The copy is the whole point of this helper being safe to call on the live structure. Shuffle works in place, and without the copy the callers original order would be gone.
             random.shuffle(new_paths)
             new_permissions[role] = new_paths
         logging.info("Reordered permissions within each role.")
@@ -140,6 +144,7 @@ class PermissionObfuscator:
             new_permissions = renamed_roles
             logging.info("Applied role renaming.")
 
+        # Passing both arguments is a trap in this helper: the reorder result replaces the renamed result instead of combining with it. Main never calls this method at all, the live path is obfuscate above, so this stays as a library only wart.
         if reordered_permissions:
             new_permissions = reordered_permissions
             logging.info("Applied permission reordering.")
@@ -242,6 +247,7 @@ def main():
                 if not isinstance(path, str):
                     raise ValueError("File paths must be strings.")
 
+        # An empty object is valid JSON and passes every shape check above, so it needs its own refusal here. Without it the tool would write an empty result and report success for doing nothing.
         if not permissions:
             logging.error("Input holds no roles; no obfuscation was performed.")
             sys.exit(1)
@@ -250,6 +256,7 @@ def main():
             logging.error("No obfuscation was requested: pass --rename-roles (optionally with --reorder-permissions). No output was written.")
             sys.exit(1)
 
+        # Main refuses a reorder only run outright. Shuffled lists with real role and path names still in them hide nothing, and writing that out as an obfuscated file would give a false sense of cover.
         if args.reorder_permissions and not args.rename_roles:
             logging.error("Reordering alone does not hide role names or paths and is not an obfuscation. Pass --rename-roles, optionally with --reorder-permissions. No output was written.")
             sys.exit(1)
