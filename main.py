@@ -1,7 +1,9 @@
 import argparse
+import json
 import logging
 import os
 import random
+import secrets
 import sys
 from typing import List, Dict
 
@@ -36,7 +38,14 @@ class PermissionObfuscator:
 
     def rename_roles(self, prefix: str = "Role") -> Dict[str, List[str]]:
         """
-        Renames roles in the permission dictionary to obfuscate their purpose.
+        Renames roles in the permission dictionary to random names.
+
+        Each new name is the prefix plus a random token. The names carry
+        no sequence number and no relation to input order, so position in
+        the output does not reveal which new name stands for which
+        original role. The mapping is kept on the instance as
+        role_mapping for the caller to persist only where the operator
+        explicitly asks; it is never logged.
 
         Args:
             prefix (str): The prefix to use for the new role names. Defaults to "Role".
@@ -45,11 +54,59 @@ class PermissionObfuscator:
             Dict[str, List[str]]: A new permission dictionary with renamed roles.
         """
         new_permissions = {}
-        for i, role in enumerate(self.permissions.keys()):
-            new_role_name = f"{prefix}{i+1}"
+        self.role_mapping = {}
+        used = set()
+        for role in self.permissions.keys():
+            new_role_name = f"{prefix}-{secrets.token_hex(4)}"
+            while new_role_name in used:
+                new_role_name = f"{prefix}-{secrets.token_hex(4)}"
+            used.add(new_role_name)
             new_permissions[new_role_name] = self.permissions[role]
-        logging.info(f"Renamed roles: {list(self.permissions.keys())} -> {list(new_permissions.keys())}")
+            self.role_mapping[role] = new_role_name
+        # Counts only: the original and replacement name lists are the
+        # mapping itself and are never written to the log.
+        logging.info(f"Renamed {len(new_permissions)} roles with prefix '{prefix}'.")
         return new_permissions
+
+    def obfuscate(self, prefix: str = "Role", reorder: bool = False):
+        """
+        Produces the obfuscated permission structure.
+
+        Roles are renamed to random names, every path string is replaced
+        with a random opaque token (one token per distinct path, used
+        consistently), the role order in the result is shuffled, and
+        each path list is shuffled when reorder is set. Nothing from the
+        original role names or path strings appears in the result.
+
+        Returns:
+            A pair: the obfuscated dictionary, and the mapping dictionary
+            with "roles" and "paths" entries. The mapping is the secret
+            that reverses the transform; the caller persists it only to
+            a file the operator explicitly names.
+        """
+        renamed = self.rename_roles(prefix)
+        entries = list(renamed.items())
+        rng = secrets.SystemRandom()
+        rng.shuffle(entries)
+
+        token_by_path: Dict[str, str] = {}
+        result: Dict[str, List[str]] = {}
+        for role, paths in entries:
+            new_paths = []
+            for path in paths:
+                if path not in token_by_path:
+                    token = f"path-{secrets.token_hex(8)}"
+                    while token in token_by_path.values():
+                        token = f"path-{secrets.token_hex(8)}"
+                    token_by_path[path] = token
+                new_paths.append(token_by_path[path])
+            if reorder:
+                rng.shuffle(new_paths)
+            result[role] = new_paths
+
+        mapping = {"roles": dict(self.role_mapping), "paths": dict(token_by_path)}
+        logging.info(f"Obfuscated {len(result)} roles and {len(token_by_path)} distinct paths.")
+        return result, mapping
 
     def reorder_permissions(self) -> Dict[str, List[str]]:
         """
@@ -145,6 +202,11 @@ def setup_argparse() -> argparse.ArgumentParser:
         type=str,
         help="Path to the output file to save the obfuscated permission structure (JSON format). If not specified, the result is printed to the console.",
     )
+    parser.add_argument(
+        "--mapping-output",
+        type=str,
+        help="Path to a file where the role and path mapping is saved as JSON. This mapping is the secret that reverses the obfuscation; it is written only when this option names a file, and that file must be protected exactly like the input.",
+    )
 
     return parser
 
@@ -180,38 +242,55 @@ def main():
                 if not isinstance(path, str):
                     raise ValueError("File paths must be strings.")
 
-        # Create PermissionObfuscator instance
+        if not permissions:
+            logging.error("Input holds no roles; no obfuscation was performed.")
+            sys.exit(1)
+
+        if not args.rename_roles and not args.reorder_permissions:
+            logging.error("No obfuscation was requested: pass --rename-roles (optionally with --reorder-permissions). No output was written.")
+            sys.exit(1)
+
+        if args.reorder_permissions and not args.rename_roles:
+            logging.error("Reordering alone does not hide role names or paths and is not an obfuscation. Pass --rename-roles, optionally with --reorder-permissions. No output was written.")
+            sys.exit(1)
+
+        # The output file, and the mapping file, may not replace the input.
+        input_resolved = os.path.realpath(args.input)
+        if args.output and os.path.realpath(args.output) == input_resolved:
+            logging.error("Output path resolves to the input file itself; refusing to overwrite the input.")
+            sys.exit(1)
+        if args.mapping_output and os.path.realpath(args.mapping_output) == input_resolved:
+            logging.error("Mapping output path resolves to the input file itself; refusing to overwrite the input.")
+            sys.exit(1)
+        if args.mapping_output and args.output and os.path.realpath(args.mapping_output) == os.path.realpath(args.output):
+            logging.error("Mapping output path must differ from the obfuscated output path.")
+            sys.exit(1)
+
+        # Create PermissionObfuscator instance and run the transform.
         obfuscator = PermissionObfuscator(permissions)
-        obfuscated_permissions = permissions.copy() # Initialized to the original permissions to avoid errors if no obfuscation is applied
+        obfuscated_permissions, mapping = obfuscator.obfuscate(args.role_prefix, args.reorder_permissions)
 
-        # Apply obfuscation techniques based on arguments
-        if args.rename_roles:
-            renamed_roles = obfuscator.rename_roles(args.role_prefix)
-            obfuscated_permissions = renamed_roles
+        # The mapping is persisted only to a file the operator names here.
+        if args.mapping_output:
+            try:
+                with open(args.mapping_output, "w") as f:
+                    json.dump(mapping, f, indent=4)
+                logging.info(f"Mapping saved to the operator named file: {args.mapping_output} ({len(mapping['roles'])} roles, {len(mapping['paths'])} paths). Protect this file exactly like the input.")
+            except Exception as e:
+                logging.error(f"Error writing to mapping output file: {e}")
+                sys.exit(1)
 
-        if args.reorder_permissions:
-            reordered_permissions = obfuscator.reorder_permissions()
-            obfuscated_permissions = reordered_permissions
-        
-        if args.rename_roles and args.reorder_permissions:
-           obfuscator = PermissionObfuscator(permissions)
-           renamed_roles = obfuscator.rename_roles(args.role_prefix)
-           obfuscator = PermissionObfuscator(renamed_roles)
-           reordered_permissions = obfuscator.reorder_permissions()
-           obfuscated_permissions = reordered_permissions
-
-        # Output the obfuscated permissions
+        # Output the obfuscated permissions. Only the obfuscated result is
+        # shown; the original is never printed beside it.
         if args.output:
             try:
                 with open(args.output, "w") as f:
-                    import json
                     json.dump(obfuscated_permissions, f, indent=4)
                 logging.info(f"Obfuscated permissions saved to: {args.output}")
             except Exception as e:
                 logging.error(f"Error writing to output file: {e}")
                 sys.exit(1)
         else:
-            obfuscator.display_permissions(permissions=permissions, title="Original Permissions")
             obfuscator.display_permissions(permissions=obfuscated_permissions, title="Obfuscated Permissions")
 
 
